@@ -44,6 +44,12 @@ Example yaml configuration file:
         spi0: {datawidth: 8, offset: 2952790016, size: 8}
         uart0: {datawidth: 8, offset: 2415919104, size: 32}
     vlnv: ::mysoc-wb_intercon:0
+    cores:
+      ::SD-card-controller:0:
+        capi_version: 1
+        core_filepath: path/to/a/file.core
+        used: false
+
 
 
 The above example is for a generator that creates verilog code for a wishbone interconnect.
@@ -147,4 +153,4 @@ When FuseSoC is launched and a core target using a generator is processed, the f
 4. A directory is created under <cache_root>/generated with a sanitized version of the calculated VLNV. This directory is where the output from the generator eventually will appear.
 5. A yaml configuration file is created in the generator output directory. The parameters from the instance are passed on to this file. FuseSoC will set the files root of the calling core as `files_root` and add the calculated vlnv.
 6. FuseSoC will switch working directory to the generator output directory and call the generator, using the command found in the generator's `command` field and with the created yaml file as command-line argument.
-7. When the generator has successfully completed, FuseSoC will scan the generator output directory for new .core files. These will be injected in the dependency tree right after the calling core and will be treated just like regular cores, except that any extra dependencies listed in the generated core will be ignored.
+7. When *all* generators have successfully completed, FuseSoC will scan the generator output directories of the generators for new core files, and insert them into the list of available cores. This updated list of cores is then resolved to include dependencies.

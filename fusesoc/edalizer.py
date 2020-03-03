@@ -5,6 +5,9 @@ import shutil
 
 from fusesoc import utils
 from fusesoc.vlnv import Vlnv
+from fusesoc.utils import merge_dict
+from fusesoc.librarymanager import Library
+from fusesoc.coremanager import DependencyError
 
 logger = logging.getLogger(__name__)
 
@@ -17,72 +20,212 @@ class FileAction(argparse.Action):
         setattr(namespace, self.dest, [path])
 
 
-class Edalizer(object):
+class Edalizer:
     def __init__(
         self,
-        vlnv,
+        toplevel,
         flags,
-        cores,
         cache_root,
         work_root,
+        core_manager,
         export_root=None,
         system_name=None,
     ):
-        if os.path.exists(work_root):
-            for f in os.listdir(work_root):
-                if os.path.isdir(os.path.join(work_root, f)):
-                    shutil.rmtree(os.path.join(work_root, f))
-                else:
-                    os.remove(os.path.join(work_root, f))
-        else:
-            os.makedirs(work_root)
-
         logger.debug("Building EDA API")
 
-        def merge_dict(d1, d2):
-            for key, value in d2.items():
-                if isinstance(value, dict):
-                    d1[key] = merge_dict(d1.get(key, {}), value)
-                elif isinstance(value, list):
-                    d1[key] = d1.get(key, []) + value
+        self.toplevel = toplevel
+        self.flags = flags
+        self.cache_root = cache_root
+        self.core_manager = core_manager
+        self.work_root = work_root
+        self.export_root = export_root
+        self.system_name = system_name
+
+        self._prepare_work_root()
+
+        self.generators = {}
+
+        self._cached_core_list_for_generator = None
+
+    @property
+    def cores(self):
+        resolved_cores = self.resolved_cores[:]
+        # resolved_cores.reverse()
+        return resolved_cores
+
+    @property
+    def resolved_cores(self):
+        """ Get a list of all "used" cores after the dependency resolution """
+        try:
+            return self.core_manager.get_depends(self.toplevel, self.flags)
+        except DependencyError as e:
+            logger.error(
+                e.msg + "\nFailed to resolve dependencies for {}".format(self.toplevel)
+            )
+            exit(1)
+        except SyntaxError as e:
+            logger.error(e.msg)
+            exit(1)
+
+    @property
+    def discovered_cores(self):
+        """ Get a list of all cores found by fusesoc """
+        return self.core_manager.db.find()
+
+    def run(self):
+        """ Run all steps to create a EDA API YAML file """
+
+        # Run the setup task on all cores (fetch and patch them as needed)
+        self.setup_cores()
+
+        # Get all generators defined in any of the cores
+        self.extract_generators()
+
+        # Run all generators. Generators can create new cores, which are added
+        # to the list of available cores.
+        self.run_generators()
+
+        # Create EDA API file contents
+        self.create_eda_api_struct()
+
+    def _core_flags(self, core):
+        """ Get flags for a specific core """
+
+        core_flags = self.flags.copy()
+        core_flags["is_toplevel"] = core.name == self.toplevel
+        return core_flags
+
+    def _prepare_work_root(self):
+        if os.path.exists(self.work_root):
+            for f in os.listdir(self.work_root):
+                if os.path.isdir(os.path.join(self.work_root, f)):
+                    shutil.rmtree(os.path.join(self.work_root, f))
                 else:
-                    d1[key] = value
-            return d1
+                    os.remove(os.path.join(self.work_root, f))
+        else:
+            os.makedirs(self.work_root)
 
-        generators = {}
-
-        first_snippets = []
-        snippets = []
-        last_snippets = []
-        _flags = flags.copy()
-        core_queue = cores[:]
-        core_queue.reverse()
-        while core_queue:
-            snippet = {}
-            core = core_queue.pop()
+    def setup_cores(self):
+        """ Setup cores: fetch resources, patch them, etc. """
+        for core in self.cores:
             logger.info("Preparing " + str(core.name))
             core.setup()
 
+    def extract_generators(self):
+        """ Get all registered generators from the cores """
+        generators = {}
+        for core in self.cores:
+            logger.debug("Searching for generators in " + str(core.name))
+            core_flags = self._core_flags(core)
+
+            if hasattr(core, "get_generators"):
+                core_generators = core.get_generators(core_flags)
+                logging.debug("Found generators: %s" % (core_generators,))
+                generators.update(core_generators)
+
+        self.generators = generators
+
+    def _invalidate_cached_core_list_for_generator(self):
+        if self._cached_core_list_for_generator:
+            self._cached_core_list_for_generator = None
+
+    def _core_list_for_generator(self):
+        """Produce a dictionary of cores, suitable for passing to a generator
+
+        The results of this functions are cached for a significant overall
+        speedup. Users need to call _invalidate_cached_core_list_for_generator()
+        whenever the CoreDB is modified.
+        """
+
+        if self._cached_core_list_for_generator:
+            return self._cached_core_list_for_generator
+
+        out = {}
+        resolved_cores = self.resolved_cores  # cache for speed
+        for core in self.discovered_cores:
+            core_flags = self._core_flags(core)
+            out[str(core)] = {
+                "capi_version": core.capi_version,
+                "core_filepath": os.path.abspath(core.core_file),
+                "used": core in resolved_cores,
+                "core_root": os.path.abspath(core.core_root),
+                "files": [str(f.name) for f in core.get_files(core_flags)],
+            }
+
+        self._cached_core_list_for_generator = out
+        return out
+
+    def run_generators(self):
+        """ Run all generators """
+        generated_libraries = []
+        for core in self.cores:
+            logger.debug("Running generators in " + str(core.name))
+            core_flags = self._core_flags(core)
+
+            if hasattr(core, "get_ttptttg"):
+                for ttptttg_data in core.get_ttptttg(core_flags):
+                    ttptttg = Ttptttg(
+                        ttptttg_data,
+                        core,
+                        self.generators,
+                        core_list=self._core_list_for_generator(),
+                    )
+                    gen_lib = ttptttg.generate(self.cache_root)
+
+                    # The output directory of the generator can contain core
+                    # files, which need to be added to the dependency tree.
+                    # This isn't done instantly, but only after all generators
+                    # have finished, to re-do the dependency resolution only
+                    # once, and not once per generator run.
+                    generated_libraries.append(gen_lib)
+
+                    # Create a dependency to all generated cores.
+                    # XXX: We need a cleaner API to the CoreManager to add
+                    # these dependencies. Until then, explicitly use a private
+                    # API to be reminded that this is a workaround.
+                    gen_cores = self.core_manager.find_cores(gen_lib)
+                    gen_core_vlnvs = [core.name for core in gen_cores]
+                    logger.debug(
+                        "The generator produced the following cores, which are inserted into the dependency tree: %s",
+                        gen_cores,
+                    )
+                    core._generator_created_dependencies += gen_core_vlnvs
+
+        # Make all new libraries known to fusesoc. This invalidates the solver
+        # cache and is therefore quite expensive.
+        for lib in generated_libraries:
+            self.core_manager.add_library(lib)
+        self._invalidate_cached_core_list_for_generator()
+
+    def create_eda_api_struct(self):
+        first_snippets = []
+        snippets = []
+        last_snippets = []
+        for core in self.cores:
+            snippet = {}
+
             logger.debug("Collecting EDA API parameters from {}".format(str(core.name)))
-            _flags["is_toplevel"] = core.name == vlnv
+            _flags = self._core_flags(core)
 
             # Extract direct dependencies
             snippet["dependencies"] = {str(core.name): getattr(core, "direct_deps", [])}
 
             # Extract files
-            if export_root:
-                files_root = os.path.join(export_root, core.sanitized_name)
+            if self.export_root:
+                files_root = os.path.join(self.export_root, core.sanitized_name)
                 core.export(files_root, _flags)
             else:
                 files_root = core.files_root
 
-            rel_root = os.path.relpath(files_root, work_root)
+            rel_root = os.path.relpath(files_root, self.work_root)
 
             # Extract parameters
             snippet["parameters"] = core.get_parameters(_flags)
 
             # Extract tool options
-            snippet["tool_options"] = {flags["tool"]: core.get_tool_options(_flags)}
+            snippet["tool_options"] = {
+                self.flags["tool"]: core.get_tool_options(_flags)
+            }
 
             # Extract scripts
             snippet["hooks"] = core.get_scripts(rel_root, _flags)
@@ -91,7 +234,7 @@ class Edalizer(object):
             for file in core.get_files(_flags):
                 if file.copyto:
                     _name = file.copyto
-                    dst = os.path.join(work_root, _name)
+                    dst = os.path.join(self.work_root, _name)
                     _dstdir = os.path.dirname(dst)
                     if not os.path.exists(_dstdir):
                         os.makedirs(_dstdir)
@@ -126,18 +269,6 @@ class Edalizer(object):
                     }
                 )
 
-            # Extract generators if defined in CAPI
-            if hasattr(core, "get_generators"):
-                generators.update(core.get_generators(_flags))
-
-            # Run generators
-            if hasattr(core, "get_ttptttg"):
-                for ttptttg_data in core.get_ttptttg(_flags):
-                    _ttptttg = Ttptttg(ttptttg_data, core, generators)
-                    for gen_core in _ttptttg.generate(cache_root):
-                        gen_core.pos = _ttptttg.pos
-                        core_queue.append(gen_core)
-
             if hasattr(core, "pos"):
                 if core.pos == "first":
                     first_snippets.append(snippet)
@@ -148,16 +279,16 @@ class Edalizer(object):
             else:
                 snippets.append(snippet)
 
-        top_core = cores[-1]
+        top_core = self.resolved_cores[-1]
         self.edalize = {
             "version": "0.2.1",
             "dependencies": {},
             "files": [],
             "hooks": {},
-            "name": system_name or top_core.sanitized_name,
+            "name": self.system_name or top_core.sanitized_name,
             "parameters": {},
             "tool_options": {},
-            "toplevel": top_core.get_toplevel(flags),
+            "toplevel": top_core.get_toplevel(self.flags),
             "vpi": [],
         }
 
@@ -271,8 +402,8 @@ from fusesoc.core import Core
 from fusesoc.utils import Launcher
 
 
-class Ttptttg(object):
-    def __init__(self, ttptttg, core, generators):
+class Ttptttg:
+    def __init__(self, ttptttg, core, generators, core_list):
         generator_name = ttptttg["generator"]
         if not generator_name in generators:
             raise RuntimeError(
@@ -300,6 +431,7 @@ class Ttptttg(object):
             "gapi": "1.0",
             "parameters": parameters,
             "vlnv": vlnv_str,
+            "cores": core_list,
         }
 
     def generate(self, cache_root):
@@ -309,7 +441,7 @@ class Ttptttg(object):
             cache_root (str): The directory where to store the generated cores
 
         Returns:
-            list: Cores created by the generator
+            Libary: A Library with the generated files
         """
         generator_cwd = os.path.join(cache_root, "generated", self.vlnv.sanitized_name)
         generator_input_file = os.path.join(generator_cwd, self.name + "_input.yml")
@@ -329,15 +461,5 @@ class Ttptttg(object):
 
         Launcher(args[0], args[1:], cwd=generator_cwd).run()
 
-        cores = []
-        logger.debug("Looking for generated cores in " + generator_cwd)
-        for root, dirs, files in os.walk(generator_cwd):
-            for f in files:
-                if f.endswith(".core"):
-                    try:
-                        cores.append(Core(os.path.join(root, f)))
-                    except SyntaxError as e:
-                        w = "Failed to parse generated core file " + f + ": " + e.msg
-                        raise RuntimeError(w)
-        logger.debug("Found " + ", ".join(str(c.name) for c in cores))
-        return cores
+        library_name = "generated-" + self.vlnv.sanitized_name
+        return Library(name=library_name, location=generator_cwd)
