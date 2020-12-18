@@ -27,4 +27,4 @@ repos:
   hooks:
   - id: pyupgrade
     # for now don't force to change from %-operator to {}
-    args: [--keep-percent-format, --py3-plus]
+    args: [--keep-percent-format, --py3-plus, --py36-plus]

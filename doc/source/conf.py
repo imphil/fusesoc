@@ -30,7 +30,7 @@ with open(os.path.join(os.path.abspath("."), "ref/capi2.rst"), "w") as f:
 # -- Project information -----------------------------------------------------
 
 project = "FuseSoC"
-copyright = "2018-{}, Olof Kindgren".format(datetime.now().year)
+copyright = f"2018-{datetime.now().year}, Olof Kindgren"
 author = "Olof Kindgren"
 
 # The short X.Y version
