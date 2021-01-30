@@ -67,9 +67,9 @@ class StringOrDict:
         if type(tree) is dict:
             for k, v in tree.items():
                 self.params = v
-                self.name = String(os.path.expandvars(k))
+                self.name = String(k)
         else:
-            self.name = String(os.path.expandvars(tree))
+            self.name = String(tree)
 
 
 class Section:
